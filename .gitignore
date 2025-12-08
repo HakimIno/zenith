@@ -1,0 +1,48 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock (keep for binaries, gitignore for libraries)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Zenith data directory
+zenith_data/
+zenith_example_data/
+*.db
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Coverage
+*.profraw
+*.profdata
+coverage/
+lcov.info
+
+# Benchmark artifacts
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Temporary files
+/tmp/
+*.tmp
+*.bak
+

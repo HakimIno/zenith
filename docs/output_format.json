@@ -1,0 +1,119 @@
+{
+  "_description": "Zenith CDC Output Format Examples",
+  "_version": "1.0",
+  
+  "insert_example": {
+    "lsn": 1234567890,
+    "xid": 12345,
+    "op": "INSERT",
+    "table": "public.users",
+    "data": {
+      "id": 1,
+      "name": "John Doe",
+      "email": "john@example.com",
+      "created_at": "2024-01-15T10:30:00Z",
+      "active": true,
+      "score": 95.5
+    },
+    "before": null,
+    "ts": "2024-01-15 10:30:00"
+  },
+  
+  "update_example_full_replica_identity": {
+    "lsn": 1234567891,
+    "xid": 12346,
+    "op": "UPDATE",
+    "table": "public.users",
+    "data": {
+      "id": 1,
+      "name": "Jane Doe",
+      "email": "jane@example.com",
+      "created_at": "2024-01-15T10:30:00Z",
+      "active": true,
+      "score": 98.0
+    },
+    "before": {
+      "id": 1,
+      "name": "John Doe",
+      "email": "john@example.com",
+      "created_at": "2024-01-15T10:30:00Z",
+      "active": true,
+      "score": 95.5
+    },
+    "ts": "2024-01-15 10:35:00"
+  },
+  
+  "update_example_default_replica_identity": {
+    "_note": "Without REPLICA IDENTITY FULL, before image is not available",
+    "lsn": 1234567892,
+    "xid": 12347,
+    "op": "UPDATE",
+    "table": "public.orders",
+    "data": {
+      "id": 100,
+      "status": "shipped",
+      "updated_at": "2024-01-15T10:40:00Z"
+    },
+    "before": null,
+    "ts": "2024-01-15 10:40:00"
+  },
+  
+  "delete_example_full": {
+    "lsn": 1234567893,
+    "xid": 12348,
+    "op": "DELETE",
+    "table": "public.users",
+    "data": {
+      "id": 1,
+      "name": "Jane Doe",
+      "email": "jane@example.com",
+      "created_at": "2024-01-15T10:30:00Z",
+      "active": true,
+      "score": 98.0
+    },
+    "before": null,
+    "ts": "2024-01-15 10:45:00"
+  },
+  
+  "delete_example_key_only": {
+    "_note": "With REPLICA IDENTITY DEFAULT, only primary key is available",
+    "lsn": 1234567894,
+    "xid": 12349,
+    "op": "DELETE",
+    "table": "public.orders",
+    "data": {
+      "id": 100
+    },
+    "before": null,
+    "ts": "2024-01-15 10:50:00"
+  },
+  
+  "clickhouse_table_schema": {
+    "_sql": "CREATE TABLE zenith_cdc (lsn UInt64, xid UInt64, op String, `table` String, data JSON, before Nullable(JSON), ts DateTime) ENGINE = MergeTree() ORDER BY (lsn, xid) PARTITION BY toYYYYMM(ts)",
+    "columns": [
+      {"name": "lsn", "type": "UInt64", "description": "Log Sequence Number - unique position in WAL"},
+      {"name": "xid", "type": "UInt64", "description": "Transaction ID from PostgreSQL"},
+      {"name": "op", "type": "String", "description": "Operation type: INSERT, UPDATE, DELETE"},
+      {"name": "table", "type": "String", "description": "Fully qualified table name (schema.table)"},
+      {"name": "data", "type": "JSON", "description": "New row data (after image)"},
+      {"name": "before", "type": "Nullable(JSON)", "description": "Old row data (before image, only for UPDATE with REPLICA IDENTITY FULL)"},
+      {"name": "ts", "type": "DateTime", "description": "Event timestamp"}
+    ]
+  },
+  
+  "data_types_mapping": {
+    "postgresql_to_json": {
+      "integer/bigint/smallint": "JSON number",
+      "real/double precision": "JSON number (float)",
+      "numeric/decimal": "JSON string (preserves precision)",
+      "boolean": "JSON boolean",
+      "text/varchar/char": "JSON string",
+      "json/jsonb": "JSON object/array",
+      "uuid": "JSON string",
+      "timestamp/date/time": "JSON string (ISO format)",
+      "bytea": "JSON string (hex encoded with \\x prefix)",
+      "array types": "JSON string (PostgreSQL array format)"
+    }
+  }
+}
+

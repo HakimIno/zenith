@@ -1,0 +1,73 @@
+# Zenith CDC Configuration Example
+# Copy this file to config.toml and modify as needed
+
+[postgres]
+# PostgreSQL connection URL with replication support
+url = "postgres://user:password@localhost:5432/mydb"
+
+# Publication name (must be created in PostgreSQL)
+# CREATE PUBLICATION zenith_pub FOR ALL TABLES;
+publication = "zenith_pub"
+
+# Replication slot name (will be created if create_slot = true)
+slot_name = "zenith_slot"
+
+# Number of parallel replication slots (for high-throughput scenarios)
+parallel_slots = 1
+
+# Create the slot automatically if it doesn't exist
+create_slot = true
+
+[clickhouse]
+# ClickHouse HTTP interface URL
+url = "http://localhost:8123"
+
+# Target database
+database = "default"
+
+# Target table (will be created if init_table is used)
+table = "zenith_cdc"
+
+# Optional authentication
+# user = "default"
+# password = ""
+
+# Batch size for inserts (larger = higher throughput, more memory)
+batch_size = 10000
+
+# Maximum time to wait before flushing a batch (milliseconds)
+batch_timeout_ms = 100
+
+# Enable gzip compression for HTTP requests
+compression = true
+
+[storage]
+# Path to store WAL position and checkpoints
+path = "./zenith_data"
+
+# How often to flush LSN position to disk (milliseconds)
+flush_interval_ms = 1000
+
+# Flush after this many rows (whichever comes first)
+flush_rows = 100000
+
+[metrics]
+# Enable Prometheus metrics endpoint
+enabled = true
+
+# Port for the metrics HTTP server
+port = 9090
+
+# Host to bind to
+host = "0.0.0.0"
+
+[pipeline]
+# Internal channel buffer size
+channel_size = 100000
+
+# Maximum buffered transactions before backpressure
+max_buffered_transactions = 10000
+
+# Number of worker threads (0 = auto-detect)
+workers = 0
+

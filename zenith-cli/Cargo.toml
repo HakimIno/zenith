@@ -1,0 +1,41 @@
+[package]
+name = "zenith-cli"
+version.workspace = true
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+description = "CLI for Zenith CDC engine"
+
+[[bin]]
+name = "zenith"
+path = "src/main.rs"
+
+[dependencies]
+zenith-core = { path = "../zenith-core" }
+zenith-storage = { path = "../zenith-storage" }
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# CLI
+clap.workspace = true
+dotenvy.workspace = true
+
+# Config
+config.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# HTTP server for metrics
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+
+# Utils
+anyhow.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+

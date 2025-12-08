@@ -1,0 +1,17 @@
+[package]
+name = "zenith-storage"
+version.workspace = true
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sled.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"
+
