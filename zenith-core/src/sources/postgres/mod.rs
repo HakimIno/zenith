@@ -25,10 +25,12 @@
 pub mod decoder;
 pub mod pgoutput_parser;
 pub mod slot;
+pub mod snapshot;
 pub mod streaming;
 
 pub use decoder::{ReplicationDecoder, ReplicationMessage, XLogData, PrimaryKeepalive};
 pub use pgoutput_parser::{PgOutputMessage, PgOutputParser, TupleData};
+pub use self::snapshot::{SnapshotCopier, SnapshotProgress};
 pub use slot::PostgresSource;  // Legacy polling-based source
 pub use streaming::{
     StreamingReplicationSource,
@@ -36,4 +38,3 @@ pub use streaming::{
     StreamingSourceMessage,
     StatusUpdateConfig,
 };
-

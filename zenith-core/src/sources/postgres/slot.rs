@@ -359,6 +359,7 @@ mod tests {
             slot_name: "test_slot".to_string(),
             parallel_slots: 4,
             create_slot: true,
+            status_update_interval_ms: 10000,
         };
 
         // Single slot

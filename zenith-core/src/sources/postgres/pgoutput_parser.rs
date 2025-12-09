@@ -902,23 +902,14 @@ mod tests {
         let relation = Relation {
             id: 1,
             namespace: "public".to_string(),
-            name: "users".to_string(),
-            replica_identity: ReplicaIdentity::Full,
+            name: "test".to_string(),
+            version: 1,
+            replica_identity: crate::schema::ReplicaIdentity::Default,
             columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    flags: 1,
-                    type_oid: 23,
-                    type_modifier: -1,
-                },
-                Column {
-                    name: "name".to_string(),
-                    flags: 0,
-                    type_oid: 25,
-                    type_modifier: -1,
-                },
+                Column { name: "id".to_string(), flags: 0, type_oid: 23, type_modifier: -1 },
+                Column { name: "name".to_string(), flags: 0, type_oid: 25, type_modifier: -1 },
             ],
-            primary_key_indices: vec![0],
+            primary_key_indices: Vec::new(),
         };
 
         let tuple = TupleData {

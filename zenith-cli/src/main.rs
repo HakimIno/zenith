@@ -23,13 +23,22 @@ use tracing_subscriber::EnvFilter;
 use zenith_core::{
     config::Config,
     metrics::METRICS,
-    pipeline::{CommitQueue, TransactionBuffer, WalPosition},
+    pipeline::{CommitQueue, TransactionBuffer, WalPosition, Event, Transaction},
     schema::SchemaRegistry,
     sinks::clickhouse::ClickHouseSink,
-    sources::postgres::PostgresSource,
+    sources::postgres::{StreamingReplicationSource, StreamingSourceMessage, snapshot::{SnapshotCopier, SnapshotProgress}},
     utils::ShutdownSignal,
 };
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use zenith_storage::WalPositionStore;
+
+/// Message type for the unified pipeline
+#[derive(Debug)]
+enum PipelineMessage {
+    Stream(StreamingSourceMessage),
+    Event(Event),
+    Progress(SnapshotProgress),
+}
 
 /// Zenith CDC - High-performance Change Data Capture
 #[derive(Parser, Debug)]
@@ -71,6 +80,10 @@ struct Args {
     /// Initialize ClickHouse table and exit
     #[arg(long)]
     init_table: bool,
+
+    /// Perform initial snapshot load
+    #[arg(long, default_value = "true")]
+    initial_load: bool,
 }
 
 #[tokio::main]
@@ -141,7 +154,7 @@ async fn main() -> Result<()> {
     }
 
     // Run the CDC pipeline
-    run_pipeline(config, storage, sink, shutdown).await?;
+    run_pipeline(config, storage, sink, shutdown, args.initial_load).await?;
 
     info!("Zenith CDC shutdown complete");
     Ok(())
@@ -194,31 +207,111 @@ async fn run_pipeline(
     storage: Arc<WalPositionStore>,
     sink: Arc<ClickHouseSink>,
     shutdown: ShutdownSignal,
+    initial_load: bool,
 ) -> Result<()> {
     // Initialize components
-    let schema_registry = Arc::new(SchemaRegistry::new());
+    let schema_registry = Arc::new(SchemaRegistry::new(&config.storage.path).context("Failed to init schema registry")?);
     let wal_position = Arc::new(WalPosition::new(storage.clone()));
     let transaction_buffer = Arc::new(TransactionBuffer::new(schema_registry.clone()));
     let commit_queue = Arc::new(CommitQueue::new(config.pipeline.max_buffered_transactions));
 
     // Create channel for source -> pipeline communication
-    let (source_tx, mut source_rx) = mpsc::channel(config.pipeline.channel_size);
+    let (pipeline_tx, mut pipeline_rx) = mpsc::channel::<PipelineMessage>(config.pipeline.channel_size);
 
-    // Start PostgreSQL source
-    let source = Arc::new(PostgresSource::new(
+    // 1. Initial Load (Snapshot) logic
+    let mut consistent_lsn_option = None;
+    
+    // Progress reporting
+    let _m = MultiProgress::new();
+    
+    if initial_load {
+        info!("Checking initial load requirements...");
+        
+        // We always run snapshot copier - it checks persistence and skips if done
+        let copier = SnapshotCopier::new(
+            config.postgres.clone(),
+            schema_registry.clone(),
+            storage.clone(),
+        );
+
+        let snap_tx_adapter = pipeline_tx.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(1000); // Snapshot event channel
+
+        // Spawn adapter for snapshot events
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if snap_tx_adapter.send(PipelineMessage::Event(event)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        
+        // Progress channel adapter
+        let (prog_tx, mut prog_rx) = mpsc::channel(100);
+        let prog_adapter = pipeline_tx.clone();
+        tokio::spawn(async move {
+            while let Some(prog) = prog_rx.recv().await {
+                if prog_adapter.send(PipelineMessage::Progress(prog)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Run snapshot
+        // We use a channel to get the consistent LSN back from the callback
+        let (lsn_tx, mut lsn_rx) = mpsc::channel(1);
+        
+        let _snapshot_handle = tokio::spawn(async move {
+            copier.run(event_tx, Some(prog_tx), |snapshot_id, lsn| async move {
+                 info!("Snapshot started: ID={}, LSN={}", snapshot_id, lsn);
+                 let _ = lsn_tx.send(lsn).await;
+                 Ok(())
+            }).await
+        });
+        
+        // Wait for LSN or completion
+        // Note: run() might finish quickly if everything is done
+        consistent_lsn_option = lsn_rx.recv().await;
+        
+        // We don't block on snapshot_handle here, it runs in background feeding events
+        // But for "seamless" we might want to start streaming concurrent with snapshot?
+        // Yes.
+    }
+
+    // Start streaming source
+    let start_lsn = if let Some(lsn) = consistent_lsn_option {
+        // If we did a snapshot, we use that LSN
+        info!("Using snapshot consistent LSN: {:X}", lsn);
+        lsn
+    } else {
+        wal_position.start_lsn()
+    };
+    
+    info!("Starting replication from LSN: {:X}", start_lsn);
+
+    // Adapter for streaming messages
+    let (stream_tx, mut stream_rx) = mpsc::channel(config.pipeline.channel_size);
+    let stream_adapter = pipeline_tx.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = stream_rx.recv().await {
+             if stream_adapter.send(PipelineMessage::Stream(msg)).await.is_err() {
+                 break;
+             }
+        }
+    });
+
+    let source = Arc::new(StreamingReplicationSource::new(
         config.postgres.clone(),
         schema_registry.clone(),
         shutdown.clone(),
-    ));
-
-    let start_lsn = wal_position.start_lsn();
-    info!("Starting replication from LSN: {:X}", start_lsn);
+    )
+    .with_snapshot_store(storage.clone())); // Use store for per-table filtering !
 
     let source_handle = {
         let source = source.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = source.start(start_lsn, source_tx).await {
+            if let Err(e) = source.start(start_lsn, stream_tx).await {
                 if !shutdown.is_triggered() {
                     error!("Source error: {}", e);
                 }
@@ -229,6 +322,17 @@ async fn run_pipeline(
     // Statistics tracking
     let total_events = Arc::new(AtomicU64::new(0));
     let last_stats_time = Arc::new(parking_lot::Mutex::new(Instant::now()));
+    
+    // Progress Bars
+    let multi_progress = MultiProgress::new();
+    let sty = ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7} rows {msg}",
+    )
+    .unwrap()
+    .progress_chars("##-");
+
+    // Map table name -> ProgressBar
+    let mut progress_bars: std::collections::HashMap<String, ProgressBar> = std::collections::HashMap::new();
 
     // Main processing loop
     let flush_interval = Duration::from_millis(config.clickhouse.batch_timeout_ms);
@@ -240,25 +344,62 @@ async fn run_pipeline(
     loop {
         tokio::select! {
             // Process messages from source
-            msg = source_rx.recv() => {
+            // Process messages from source
+            msg = pipeline_rx.recv() => {
                 match msg {
-                    Some(source_msg) => {
-                        wal_position.update_received(source_msg.lsn);
+                    Some(PipelineMessage::Stream(source_msg)) => {
+                        wal_position.update_received(source_msg.end_lsn);
 
                         // Process through transaction buffer
-                        if let Some(committed_txn) = transaction_buffer.process_message(
+                        match transaction_buffer.process_message(
                             source_msg.message,
-                            source_msg.lsn,
+                            source_msg.end_lsn,
                         ) {
-                            // Add to commit queue
-                            if !commit_queue.push(committed_txn) {
-                                warn!("Commit queue full, applying backpressure");
-                                // In production, we'd wait or slow down
-                            }
+                             zenith_core::pipeline::transaction_buffer::BufferResult::Transaction(committed_txn) => {
+                                // Add to commit queue
+                                if !commit_queue.push(committed_txn) {
+                                    warn!("Commit queue full, applying backpressure");
+                                }
+                             }
+                             zenith_core::pipeline::transaction_buffer::BufferResult::SchemaChange(relation) => {
+                                 info!("Schema change detected for {}, triggering migration", relation.full_name());
+                                 // Trigger migration
+                                 let sink = sink.clone();
+                                 tokio::spawn(async move {
+                                     if let Err(e) = sink.migrate(&relation).await {
+                                         error!("Failed to migrate schema for {}: {}", relation.full_name(), e);
+                                     }
+                                 });
+                             }
+                             zenith_core::pipeline::transaction_buffer::BufferResult::None => {}
                         }
-
-                        // Update buffer metrics
                         METRICS.set_buffer_size(transaction_buffer.len());
+                    }
+                    Some(PipelineMessage::Event(event)) => {
+                        // Handle snapshot event
+                        // Treat as a committed transaction with 1 event
+                        let mut txn = Transaction::new(0, 0); // XID 0 for snapshot
+                        let lsn = event.lsn;
+                        txn.add_event(event);
+                        txn.commit(lsn, 0);
+                        
+                        if !commit_queue.push(txn) {
+                             warn!("Commit queue full during snapshot, applying backpressure");
+                        }
+                    }
+                    Some(PipelineMessage::Progress(prog)) => {
+                        let bar = progress_bars.entry(prog.table.clone()).or_insert_with(|| {
+                            let pb = multi_progress.add(ProgressBar::new_spinner());
+                            pb.set_style(sty.clone());
+                            pb.set_message(format!("Snapshotting {}", prog.table));
+                            pb
+                        });
+                        
+                        if prog.complete {
+                            bar.finish_with_message(format!("{} done ({} rows)", prog.table, prog.rows_processed));
+                        } else {
+                            bar.set_position(prog.rows_processed);
+                        }
                     }
                     None => {
                         info!("Source channel closed");

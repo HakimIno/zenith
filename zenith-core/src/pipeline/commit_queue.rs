@@ -248,6 +248,7 @@ mod tests {
                 xid,
                 Operation::Insert,
                 "test.table".to_string(),
+                "test_table_v1".to_string(), // selector
                 serde_json::json!({"id": i}),
                 None,
                 Utc::now(),

@@ -4,7 +4,7 @@ use zenith_core::schema::{Column, Relation, ReplicaIdentity, SchemaRegistry};
 use zenith_core::sources::postgres::pgoutput_parser::{
     ColumnValue, PgOutputMessage, PgOutputParser, TupleData,
 };
-use zenith_core::pipeline::transaction_buffer::{TransactionBuffer, Operation};
+use zenith_core::pipeline::transaction_buffer::{TransactionBuffer, Operation, BufferResult};
 use std::sync::Arc;
 
 /// Helper to create test messages
@@ -225,38 +225,43 @@ fn test_full_transaction_flow() {
 #[test]
 fn test_transaction_buffer_integration() {
     // Setup schema registry
-    let registry = Arc::new(SchemaRegistry::new());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(SchemaRegistry::new(temp_dir.path()).unwrap());
     registry.register(Relation {
         id: 16384,
         namespace: "public".to_string(),
         name: "users".to_string(),
+        version: 1,
         replica_identity: ReplicaIdentity::Full,
         columns: vec![
             Column { name: "id".to_string(), flags: 0x01, type_oid: 23, type_modifier: -1 },
             Column { name: "name".to_string(), flags: 0x00, type_oid: 25, type_modifier: -1 },
         ],
         primary_key_indices: vec![0],
-    });
+    }).unwrap();
 
     let buffer = TransactionBuffer::new(registry);
     let parser = PgOutputParser::new();
 
     // Process transaction
     let begin = parser.parse(&message_builder::begin(100, 1000, 0)).unwrap();
-    assert!(buffer.process_message(begin, 1000).is_none());
+    assert!(matches!(buffer.process_message(begin, 1000), BufferResult::None));
 
     let insert = parser.parse(&message_builder::insert(16384, &["1", "Test"])).unwrap();
-    assert!(buffer.process_message(insert, 1001).is_none());
+    assert!(matches!(buffer.process_message(insert, 1001), BufferResult::None));
 
     let insert2 = parser.parse(&message_builder::insert(16384, &["2", "Test2"])).unwrap();
-    assert!(buffer.process_message(insert2, 1002).is_none());
+    assert!(matches!(buffer.process_message(insert2, 1002), BufferResult::None));
 
     // Commit should return the transaction
     let commit = parser.parse(&message_builder::commit(0, 1003, 1003, 0)).unwrap();
-    let txn = buffer.process_message(commit, 1003);
+    let result = buffer.process_message(commit, 1003);
 
-    assert!(txn.is_some());
-    let txn = txn.unwrap();
+    let txn = match result {
+        BufferResult::Transaction(txn) => txn,
+        _ => panic!("Expected committed transaction"),
+    };
+
     assert_eq!(txn.xid, 100);
     assert_eq!(txn.events.len(), 2);
     assert!(txn.committed);
@@ -306,12 +311,14 @@ fn test_null_and_unchanged_values() {
 
 #[test]
 fn test_schema_registry() {
-    let registry = SchemaRegistry::new();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let registry = SchemaRegistry::new(temp_dir.path()).unwrap();
 
     let relation = Relation {
         id: 16384,
         namespace: "public".to_string(),
         name: "users".to_string(),
+        version: 1,
         replica_identity: ReplicaIdentity::Full,
         columns: vec![
             Column { name: "id".to_string(), flags: 0x01, type_oid: 23, type_modifier: -1 },
@@ -320,7 +327,7 @@ fn test_schema_registry() {
         primary_key_indices: vec![0],
     };
 
-    registry.register(relation);
+    registry.register(relation).unwrap();
 
     assert!(registry.contains(16384));
     assert!(!registry.contains(99999));
@@ -339,6 +346,7 @@ fn test_tuple_json_conversion() {
         id: 1,
         namespace: "public".to_string(),
         name: "test".to_string(),
+        version: 1,
         replica_identity: ReplicaIdentity::Full,
         columns: vec![
             Column { name: "id".to_string(), flags: 0x01, type_oid: 23, type_modifier: -1 },

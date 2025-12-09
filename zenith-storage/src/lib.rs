@@ -34,6 +34,7 @@ const CONFIRMED_LSN_KEY: &[u8] = b"confirmed_lsn";
 const SLOT_PREFIX: &[u8] = b"slot:";
 const CHECKPOINT_TREE: &str = "checkpoints";
 const METADATA_TREE: &str = "metadata";
+const SNAPSHOT_TREE: &str = "snapshot_progress";
 
 /// Checkpoint data for a replication slot
 #[derive(Debug, Clone)]
@@ -89,6 +90,7 @@ pub struct WalPositionStore {
     db: Db,
     checkpoints: Tree,
     metadata: Tree,
+    snapshot_progress: Tree,
     cached_lsn: AtomicU64,
     pending_flush: RwLock<PendingFlush>,
 }
@@ -119,6 +121,7 @@ impl WalPositionStore {
 
         let checkpoints = db.open_tree(CHECKPOINT_TREE)?;
         let metadata = db.open_tree(METADATA_TREE)?;
+        let snapshot_progress = db.open_tree(SNAPSHOT_TREE)?;
 
         // Load cached LSN from storage
         let cached_lsn = metadata
@@ -138,6 +141,7 @@ impl WalPositionStore {
             db,
             checkpoints,
             metadata,
+            snapshot_progress,
             cached_lsn: AtomicU64::new(cached_lsn),
             pending_flush: RwLock::new(PendingFlush {
                 rows_since_flush: 0,
@@ -245,6 +249,26 @@ impl WalPositionStore {
         // Sled doesn't have explicit compaction, but we can flush
         self.db.flush()?;
         Ok(())
+    }
+
+    /// Record that a table has been snapshotted at a specific LSN
+    pub fn set_table_snapshot_lsn(&self, table: &str, lsn: u64) -> Result<()> {
+        self.snapshot_progress.insert(table.as_bytes(), &lsn.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Get the LSN at which a table was snapshotted (if any)
+    pub fn get_table_snapshot_lsn(&self, table: &str) -> Result<Option<u64>> {
+        match self.snapshot_progress.get(table.as_bytes())? {
+            Some(v) => {
+                if v.len() >= 8 {
+                    Ok(Some(u64::from_be_bytes(v[..8].try_into().unwrap())))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
     }
 }
 

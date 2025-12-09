@@ -29,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::metrics::METRICS;
 use crate::schema::SchemaRegistry;
 use crate::utils::ShutdownSignal;
+use zenith_storage::WalPositionStore;
 
 use bytes::{BufMut, BytesMut};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -184,6 +185,7 @@ pub struct StreamingReplicationSource {
     shutdown: ShutdownSignal,
     status_config: StatusUpdateConfig,
     lsn_tracker: Arc<LsnTracker>,
+    snapshot_store: Option<Arc<WalPositionStore>>,
 }
 
 impl StreamingReplicationSource {
@@ -194,17 +196,27 @@ impl StreamingReplicationSource {
         shutdown: ShutdownSignal,
     ) -> Self {
         Self {
-            config,
+            config: config.clone(),
             schema_registry,
             shutdown,
-            status_config: StatusUpdateConfig::default(),
+            status_config: StatusUpdateConfig {
+                interval: config.status_interval(),
+                reply_to_keepalive: true,
+            },
             lsn_tracker: Arc::new(LsnTracker::new(0)),
+            snapshot_store: None,
         }
     }
 
     /// Create with custom status update configuration
     pub fn with_status_config(mut self, config: StatusUpdateConfig) -> Self {
         self.status_config = config;
+        self
+    }
+
+    /// Set a snapshot store for filtering (deduplication)
+    pub fn with_snapshot_store(mut self, store: Arc<WalPositionStore>) -> Self {
+        self.snapshot_store = Some(store);
         self
     }
 
@@ -742,6 +754,33 @@ impl StreamingReplicationSource {
 
                                     match decoder.parse_pgoutput(&xlog.data) {
                                         Ok(msg) => {
+                                            // Deduplication: Skip events already in snapshot (per table)
+                                            if let Some(ref store) = self.snapshot_store {
+                                                let should_skip = match &msg {
+                                                    PgOutputMessage::Insert { relation_id, .. } |
+                                                    PgOutputMessage::Update { relation_id, .. } |
+                                                    PgOutputMessage::Delete { relation_id, .. } => {
+                                                        if let Some(rel) = self.schema_registry.get(*relation_id) {
+                                                            let table = rel.full_name();
+                                                            if let Ok(Some(snap_lsn)) = store.get_table_snapshot_lsn(&table) {
+                                                                xlog.end_lsn <= snap_lsn
+                                                            } else {
+                                                                false
+                                                            }
+                                                        } else {
+                                                            false
+                                                        }
+                                                    },
+                                                    _ => false
+                                                };
+                                                
+                                                if should_skip {
+                                                    self.lsn_tracker.update_flush(xlog.end_lsn);
+                                                    self.lsn_tracker.update_apply(xlog.end_lsn);
+                                                    continue;
+                                                }
+                                            }
+
                                             METRICS.record_event(&self.config.slot_name, msg.type_name());
 
                                             let source_msg = StreamingSourceMessage {
@@ -919,6 +958,7 @@ impl StreamingReplicationSourceBuilder {
             shutdown: self.shutdown,
             status_config: self.status_config,
             lsn_tracker: Arc::new(LsnTracker::new(0)),
+            snapshot_store: None,
         }
     }
 }

@@ -7,6 +7,7 @@ use crate::config::ClickHouseConfig;
 use crate::error::{Error, Result};
 use crate::metrics::METRICS;
 use crate::pipeline::transaction_buffer::Event;
+use super::migrator::ClickHouseMigrator;
 
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE};
 use reqwest::Client;
@@ -35,6 +36,7 @@ PARTITION BY toYYYYMM(ts)
 pub struct ClickHouseSink {
     config: ClickHouseConfig,
     client: Client,
+    migrator: ClickHouseMigrator,
     /// Semaphore for concurrent batch uploads
     upload_semaphore: Arc<Semaphore>,
     /// Batch buffer
@@ -85,6 +87,7 @@ impl ClickHouseSink {
             .map_err(|e| Error::clickhouse(format!("Failed to create HTTP client: {}", e)))?;
 
         let sink = Self {
+            migrator: ClickHouseMigrator::new(config.clone()),
             config,
             client,
             upload_semaphore: Arc::new(Semaphore::new(4)), // Max 4 concurrent uploads
@@ -99,17 +102,24 @@ impl ClickHouseSink {
 
     /// Initialize the target table if it doesn't exist
     pub async fn init_table(&self) -> Result<()> {
+        // Legacy initialization for single-table mode
+        // For schema evolution, we rely on migrate() calls
         let sql = CREATE_TABLE_SQL
             .replace("{database}", &self.config.database)
             .replace("{table}", &self.config.table);
 
         self.execute_query(&sql).await?;
         info!(
-            "Initialized table {}.{}",
+            "Initialized base table {}.{}",
             self.config.database, self.config.table
         );
 
         Ok(())
+    }
+
+    /// Run migration for a relation
+    pub async fn migrate(&self, relation: &crate::schema::Relation) -> Result<()> {
+        self.migrator.migrate(relation).await
     }
 
     /// Add events to the batch buffer
@@ -157,35 +167,77 @@ impl ClickHouseSink {
     }
 
     /// Flush a specific set of events
-    pub async fn flush_events(&self, events: Vec<Event>) -> Result<u64> {
+    pub async fn flush_events(&self, mut events: Vec<Event>) -> Result<u64> {
         if events.is_empty() {
             return Ok(0);
         }
 
         let event_count = events.len() as u64;
         let start = Instant::now();
+        let mut total_bytes = 0;
 
         // Acquire semaphore for concurrent upload limiting
         let _permit = self.upload_semaphore.acquire().await.unwrap();
 
-        // Build JSON Lines format for ClickHouse
-        let body = self.build_jsonl_body(&events)?;
-        let body_len = body.len();
+        // Sort by selector to group events
+        events.sort_by(|a, b| a.selector.cmp(&b.selector));
 
-        // Build the insert query
-        let url = format!(
-            "{}/",
-            self.config.url.trim_end_matches('/')
+        let mut chunk_start = 0;
+        if !events.is_empty() {
+            let mut current_selector = &events[0].selector;
+
+            for i in 1..events.len() {
+                if &events[i].selector != current_selector {
+                    let chunk = &events[chunk_start..i];
+                    total_bytes += self.flush_chunk(chunk, current_selector).await?;
+                    
+                    current_selector = &events[i].selector;
+                    chunk_start = i;
+                }
+            }
+            // Flush last chunk
+            if chunk_start < events.len() {
+                let chunk = &events[chunk_start..];
+                total_bytes += self.flush_chunk(chunk, current_selector).await?;
+            }
+        }
+
+        let elapsed = start.elapsed();
+
+        // Update statistics
+        self.stats.batches_sent.fetch_add(1, Ordering::Relaxed);
+        self.stats.events_flushed.fetch_add(event_count, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(total_bytes as u64, Ordering::Relaxed);
+
+        // Record metrics (dimension: first table in batch - approximation)
+        if let Some(first) = events.first() {
+            METRICS.record_flush(&first.table, event_count);
+        }
+        METRICS.record_batch_latency("clickhouse", elapsed.as_secs_f64());
+
+        debug!(
+            "Flushed {} events to ClickHouse in {:?} ({} bytes)",
+            event_count, elapsed, total_bytes
         );
 
+        Ok(event_count)
+    }
+
+    async fn flush_chunk(&self, events: &[Event], selector: &str) -> Result<usize> {
+        // Build JSON Lines format
+        let body = self.build_jsonl_body(events)?;
+        let body_len = body.len();
+
+        let url = format!("{}/", self.config.url.trim_end_matches('/'));
+        
+        // Use the selector as the table name (e.g. users_v1)
         let query = format!(
             "INSERT INTO {}.{} FORMAT JSONEachRow",
-            self.config.database, self.config.table
+            self.config.database, selector
         );
 
         let mut request = self.client.post(&url).query(&[("query", &query)]);
 
-        // Add authentication if configured
         if let Some(ref user) = self.config.user {
             request = request.query(&[("user", user)]);
         }
@@ -193,7 +245,6 @@ impl ClickHouseSink {
             request = request.query(&[("password", password)]);
         }
 
-        // Compress if enabled
         let body = if self.config.compression {
             compress_gzip(&body)?
         } else {
@@ -208,28 +259,12 @@ impl ClickHouseSink {
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
             METRICS.record_error("clickhouse_insert");
             return Err(Error::clickhouse(format!(
-                "Insert failed with status {}: {}",
-                status, text
+                "Insert failed for {} with status {}: {}",
+                selector, status, text
             )));
         }
 
-        let elapsed = start.elapsed();
-
-        // Update statistics
-        self.stats.batches_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats.events_flushed.fetch_add(event_count, Ordering::Relaxed);
-        self.stats.bytes_sent.fetch_add(body_len as u64, Ordering::Relaxed);
-
-        // Record metrics
-        METRICS.record_flush(&self.config.table, event_count);
-        METRICS.record_batch_latency("clickhouse", elapsed.as_secs_f64());
-
-        debug!(
-            "Flushed {} events to ClickHouse in {:?} ({} bytes)",
-            event_count, elapsed, body_len
-        );
-
-        Ok(event_count)
+        Ok(body_len)
     }
 
     /// Build JSON Lines body for ClickHouse
@@ -388,6 +423,7 @@ mod tests {
             1,
             Operation::Insert,
             "public.users".to_string(),
+            "users_v1".to_string(), // selector
             serde_json::json!({"id": id, "name": "test"}),
             None,
             Utc::now(),
@@ -405,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_jsonl_body_format() {
-        let config = ClickHouseConfig {
+        let _config = ClickHouseConfig {
             url: "http://localhost:8123".to_string(),
             database: "default".to_string(),
             table: "zenith_cdc".to_string(),

@@ -47,6 +47,10 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(true),
+                status_update_interval_ms: std::env::var("POSTGRES_STATUS_INTERVAL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10_000),
             },
             clickhouse: ClickHouseConfig {
                 url: std::env::var("CLICKHOUSE_URL")
@@ -115,6 +119,15 @@ pub struct PostgresConfig {
     /// Create slot if it doesn't exist
     #[serde(default = "default_true")]
     pub create_slot: bool,
+    /// Status update interval in milliseconds
+    #[serde(default = "default_status_update_interval")]
+    pub status_update_interval_ms: u64,
+}
+
+impl PostgresConfig {
+    pub fn status_interval(&self) -> Duration {
+        Duration::from_millis(self.status_update_interval_ms)
+    }
 }
 
 /// ClickHouse sink configuration
@@ -247,6 +260,10 @@ fn default_max_buffered_txns() -> usize {
 
 fn default_workers() -> usize {
     num_cpus::get().max(4)
+}
+
+fn default_status_update_interval() -> u64 {
+    10_000
 }
 
 // Add num_cpus as inline

@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Operation type for CDC events
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +44,8 @@ pub struct Event {
     pub op: Operation,
     /// Fully qualified table name (schema.table)
     pub table: String,
+    /// Target table name for ClickHouse (e.g. table_v1)
+    pub selector: String,
     /// New data (for INSERT and UPDATE)
     pub data: Value,
     /// Old data (for UPDATE with REPLICA IDENTITY FULL, DELETE with FULL)
@@ -61,6 +63,7 @@ impl Event {
         xid: u64,
         op: Operation,
         table: String,
+        selector: String,
         data: Value,
         before: Option<Value>,
         ts: DateTime<Utc>,
@@ -71,6 +74,7 @@ impl Event {
             xid,
             op,
             table,
+            selector,
             data,
             before,
             ts,
@@ -193,6 +197,17 @@ pub struct BufferStats {
     pub events_buffered: AtomicU64,
 }
 
+/// Result of processing a message
+#[derive(Debug)]
+pub enum BufferResult {
+    /// A transaction was committed
+    Transaction(Transaction),
+    /// A schema change occurred
+    SchemaChange(crate::schema::Relation),
+    /// No actionable result (message buffered or ignored)
+    None,
+}
+
 impl TransactionBuffer {
     /// Create a new transaction buffer
     pub fn new(schema_registry: Arc<SchemaRegistry>) -> Self {
@@ -216,12 +231,12 @@ impl TransactionBuffer {
 
     /// Process a pgoutput message
     ///
-    /// Returns Some(Transaction) if a transaction was committed and is ready to flush.
+    /// Returns BufferResult which may contain a committed transaction or schema change.
     pub fn process_message(
         &self,
         message: PgOutputMessage,
         lsn: u64,
-    ) -> Option<Transaction> {
+    ) -> BufferResult {
         match message {
             PgOutputMessage::Begin {
                 xid,
@@ -233,7 +248,7 @@ impl TransactionBuffer {
                 self.transactions.insert(xid, txn);
                 self.current_xid.store(xid, Ordering::Release);
                 self.stats.transactions_started.fetch_add(1, Ordering::Relaxed);
-                None
+                BufferResult::None
             }
 
             PgOutputMessage::Commit {
@@ -251,10 +266,10 @@ impl TransactionBuffer {
 
                     // Return non-empty committed transactions
                     if !txn.is_empty() {
-                        return Some(txn);
+                        return BufferResult::Transaction(txn);
                     }
                 }
-                None
+                BufferResult::None
             }
 
             PgOutputMessage::Insert {
@@ -262,7 +277,7 @@ impl TransactionBuffer {
                 new_tuple,
             } => {
                 self.process_insert(relation_id, new_tuple, lsn);
-                None
+                BufferResult::None
             }
 
             PgOutputMessage::Update {
@@ -271,7 +286,7 @@ impl TransactionBuffer {
                 new_tuple,
             } => {
                 self.process_update(relation_id, old_tuple, new_tuple, lsn);
-                None
+                BufferResult::None
             }
 
             PgOutputMessage::Delete {
@@ -280,11 +295,43 @@ impl TransactionBuffer {
                 key_only,
             } => {
                 self.process_delete(relation_id, old_tuple, key_only, lsn);
-                None
+                BufferResult::None
             }
 
-            // Relation messages are handled at the source level
-            PgOutputMessage::Relation { .. } => None,
+            // Relation messages - Register schema updates
+            PgOutputMessage::Relation { id, namespace, name, replica_identity, columns } => {
+                // Reconstruct primary key indices
+                let mut primary_key_indices = Vec::new();
+                for (i, col) in columns.iter().enumerate() {
+                    if (col.flags & 1) != 0 {
+                         primary_key_indices.push(i);
+                    }
+                }
+
+                let relation = crate::schema::Relation {
+                    id,
+                    namespace,
+                    name,
+                    version: 0, // Registry will override this
+                    replica_identity,
+                    columns,
+                    primary_key_indices,
+                };
+
+                match self.schema_registry.register(relation.clone()) {
+                    Ok(crate::schema::registry::SchemaChange::Updated { old_version, new_version }) => {
+                        info!("Schema updated: v{} -> v{}", old_version, new_version);
+                        return BufferResult::SchemaChange(relation);
+                    },
+                    Ok(crate::schema::registry::SchemaChange::Created) => {
+                         debug!("New schema created");
+                         return BufferResult::SchemaChange(relation);
+                    },
+                    Ok(crate::schema::registry::SchemaChange::None) => {},
+                    Err(e) => warn!("Failed to register relation update: {}", e),
+                }
+                BufferResult::None
+            }
 
             // Streaming transaction messages
             PgOutputMessage::StreamStart { xid, first_segment } => {
@@ -293,7 +340,7 @@ impl TransactionBuffer {
                     self.transactions.insert(xid, txn);
                 }
                 self.current_xid.store(xid, Ordering::Release);
-                None
+                BufferResult::None
             }
 
             PgOutputMessage::StreamCommit {
@@ -306,18 +353,18 @@ impl TransactionBuffer {
                     txn.commit(commit_lsn, commit_time);
                     self.stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
                     if !txn.is_empty() {
-                        return Some(txn);
+                        return BufferResult::Transaction(txn);
                     }
                 }
-                None
+                BufferResult::None
             }
 
             PgOutputMessage::StreamAbort { xid, .. } => {
                 self.transactions.remove(&xid);
-                None
+                BufferResult::None
             }
 
-            PgOutputMessage::StreamStop => None,
+            PgOutputMessage::StreamStop => BufferResult::None,
 
             // Log and ignore other messages
             PgOutputMessage::Type { .. }
@@ -325,9 +372,14 @@ impl TransactionBuffer {
             | PgOutputMessage::Truncate { .. }
             | PgOutputMessage::Message { .. } => {
                 debug!("Ignoring message: {:?}", message.type_name());
-                None
+                BufferResult::None
             }
         }
+    }
+ 
+    /// Process StreamStop message
+    pub fn process_stream_stop(&self) -> BufferResult {
+        BufferResult::None
     }
 
     /// Process INSERT message
@@ -339,12 +391,14 @@ impl TransactionBuffer {
             let data = new_tuple.to_json(&relation);
             let pk = new_tuple.extract_pk(&relation);
             let ts = Utc::now();
+            let selector = format!("{}_v{}", relation.name, relation.version);
 
             let event = Event::new(
                 lsn,
                 xid,
                 Operation::Insert,
                 table,
+                selector,
                 data,
                 None,
                 ts,
@@ -373,12 +427,14 @@ impl TransactionBuffer {
             let before = old_tuple.as_ref().map(|t| t.to_json(&relation));
             let pk = new_tuple.extract_pk(&relation);
             let ts = Utc::now();
+            let selector = format!("{}_v{}", relation.name, relation.version);
 
             let event = Event::new(
                 lsn,
                 xid,
                 Operation::Update,
                 table,
+                selector,
                 data,
                 before,
                 ts,
@@ -413,12 +469,14 @@ impl TransactionBuffer {
             
             let pk = old_tuple.extract_pk(&relation);
             let ts = Utc::now();
+            let selector = format!("{}_v{}", relation.name, relation.version);
 
             let event = Event::new(
                 lsn,
                 xid,
                 Operation::Delete,
                 table,
+                selector,
                 data,
                 None,
                 ts,
@@ -480,11 +538,13 @@ mod tests {
     use crate::sources::postgres::pgoutput_parser::ColumnValue;
 
     fn create_test_registry() -> Arc<SchemaRegistry> {
-        let registry = SchemaRegistry::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let registry = SchemaRegistry::new(temp_dir.path()).unwrap();
         registry.register(Relation {
             id: 16384,
             namespace: "public".to_string(),
             name: "users".to_string(),
+            version: 1,
             replica_identity: ReplicaIdentity::Full,
             columns: vec![
                 Column {
@@ -501,7 +561,7 @@ mod tests {
                 },
             ],
             primary_key_indices: vec![0],
-        });
+        }).unwrap();
         Arc::new(registry)
     }
 
@@ -511,7 +571,7 @@ mod tests {
         let buffer = TransactionBuffer::new(registry);
 
         // Begin transaction
-        buffer.process_message(
+        let result = buffer.process_message(
             PgOutputMessage::Begin {
                 xid: 100,
                 commit_time: 0,
@@ -519,11 +579,12 @@ mod tests {
             },
             1000,
         );
+        assert!(matches!(result, BufferResult::None));
 
         assert_eq!(buffer.len(), 1);
 
         // Insert event
-        buffer.process_message(
+        let result = buffer.process_message(
             PgOutputMessage::Insert {
                 relation_id: 16384,
                 new_tuple: TupleData {
@@ -535,6 +596,7 @@ mod tests {
             },
             1001,
         );
+        assert!(matches!(result, BufferResult::None));
 
         // Commit transaction
         let committed = buffer.process_message(
@@ -547,8 +609,10 @@ mod tests {
             1002,
         );
 
-        assert!(committed.is_some());
-        let txn = committed.unwrap();
+        let txn = match committed {
+             BufferResult::Transaction(txn) => txn,
+             _ => panic!("Expected committed transaction"),
+        };
         assert_eq!(txn.xid, 100);
         assert_eq!(txn.events.len(), 1);
         assert!(txn.committed);
@@ -562,6 +626,7 @@ mod tests {
             100,
             Operation::Insert,
             "public.users".to_string(),
+            "users_v1".to_string(), // selector
             serde_json::json!({"id": 1, "name": "John"}),
             None,
             Utc::now(),
@@ -571,6 +636,7 @@ mod tests {
         let json = event.to_json();
         assert_eq!(json["op"], "INSERT");
         assert_eq!(json["table"], "public.users");
+        // selector is not serialized to JSON currently, but that's fine
         assert_eq!(json["data"]["id"], 1);
     }
 }

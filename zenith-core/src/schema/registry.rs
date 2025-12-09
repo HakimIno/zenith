@@ -2,8 +2,10 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tracing::debug;
+use std::sync::{Arc, Mutex};
+use tracing::{debug, info};
+use rusqlite::{params, Connection};
+use anyhow::{Result, Context};
 
 /// Column metadata from PostgreSQL
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +58,9 @@ impl From<u8> for ReplicaIdentity {
 pub struct Relation {
     /// Relation OID
     pub id: u32,
+    /// Schema version (monotonically increasing)
+    #[serde(default)]
+    pub version: u32,
     /// Schema/namespace name
     pub namespace: String,
     /// Table name
@@ -102,6 +107,14 @@ impl Relation {
     }
 }
 
+/// Schema change type result
+#[derive(Debug, PartialEq, Eq)]
+pub enum SchemaChange {
+    None,
+    Created,
+    Updated { old_version: u32, new_version: u32 },
+}
+
 /// Schema registry for tracking relation metadata
 ///
 /// Thread-safe registry that maps relation IDs to their metadata.
@@ -111,32 +124,122 @@ pub struct SchemaRegistry {
     relations: Arc<DashMap<u32, Relation>>,
     /// Index by full name for reverse lookups
     by_name: Arc<DashMap<String, u32>>,
+    /// SQLite connection for persistence
+    db: Arc<Mutex<Connection>>,
 }
 
 impl SchemaRegistry {
-    /// Create a new empty schema registry
-    pub fn new() -> Self {
-        Self {
+    /// Create a new schema registry backed by SQLite
+    pub fn new(storage_path: &std::path::Path) -> Result<Self> {
+        let db_path = storage_path.join("schema_registry.sqlite");
+        let conn = Connection::open(&db_path).context("Failed to open schema registry DB")?;
+        
+        // Initialize tables
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS relations (
+                id INTEGER PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                name TEXT NOT NULL,
+                metadata JSON NOT NULL
+            )",
+            [],
+        )?;
+        
+        let registry = Self {
             relations: Arc::new(DashMap::new()),
             by_name: Arc::new(DashMap::new()),
+            db: Arc::new(Mutex::new(conn)),
+        };
+        
+        // Load existing relations
+        registry.load_from_disk()?;
+        
+        Ok(registry)
+    }
+
+    fn load_from_disk(&self) -> Result<()> {
+        let conn = self.db.lock().map_err(|_| anyhow::anyhow!("Lock poisoned"))?;
+        let mut stmt = conn.prepare("SELECT id, metadata FROM relations")?;
+        
+        let rows = stmt.query_map([], |row| {
+            let id: u32 = row.get(0)?;
+            let metadata: String = row.get(1)?;
+            Ok((id, metadata))
+        })?;
+        
+        for row in rows {
+            let (id, metadata) = row?;
+            let relation: Relation = serde_json::from_str(&metadata)?;
+            self.relations.insert(id, relation.clone());
+            self.by_name.insert(relation.full_name(), id);
         }
+        
+        info!("Loaded {} relations from disk", self.relations.len());
+        Ok(())
     }
 
     /// Register or update a relation
-    pub fn register(&self, relation: Relation) {
+    /// Returns the type of change (None, Created, Updated)
+    pub fn register(&self, mut relation: Relation) -> Result<SchemaChange> {
         let full_name = relation.full_name();
         let id = relation.id;
 
+        // Check for existing
+        if let Some(mut existing) = self.relations.get_mut(&id) {
+            // Check if schema matches
+            // We compare columns and primary keys.
+            // Note: We ignore flags for now as they might flutter, but ideally should verify type_oid/mod
+            let schema_changed = existing.columns.len() != relation.columns.len() 
+                || existing.columns.iter().zip(relation.columns.iter()).any(|(a, b)| {
+                    a.name != b.name || a.type_oid != b.type_oid
+                });
+
+            if !schema_changed {
+                return Ok(SchemaChange::None);
+            }
+
+            // Update version
+            relation.version = existing.version + 1;
+            let old_version = existing.version;
+            
+            // Persist
+            {
+                let conn = self.db.lock().map_err(|_| anyhow::anyhow!("Lock poisoned"))?;
+                let metadata = serde_json::to_string(&relation)?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO relations (id, namespace, name, metadata) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, relation.namespace, relation.name, metadata],
+                )?;
+            }
+
+            // Update memory
+            *existing = relation.clone();
+            
+            info!("Schema updated for {} (v{} -> v{})", full_name, old_version, relation.version);
+            return Ok(SchemaChange::Updated { old_version, new_version: relation.version });
+        }
+
+        // New relation
+        relation.version = 1; // Start at v1
         debug!(
-            "Registered relation {} ({}) with {} columns, PK: {:?}",
-            full_name,
-            id,
-            relation.columns.len(),
-            relation.primary_key_columns()
+            "Registered new relation {} ({}) v1 with {} columns",
+            full_name, id, relation.columns.len()
         );
 
-        self.by_name.insert(full_name, id);
+        // Persist
+        {
+            let conn = self.db.lock().map_err(|_| anyhow::anyhow!("Lock poisoned"))?;
+            let metadata = serde_json::to_string(&relation)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO relations (id, namespace, name, metadata) VALUES (?1, ?2, ?3, ?4)",
+                params![id, relation.namespace, relation.name, metadata],
+            )?;
+        }
+
+        self.by_name.insert(full_name.clone(), id);
         self.relations.insert(id, relation);
+        
+        Ok(SchemaChange::Created)
     }
 
     /// Get a relation by ID
@@ -173,7 +276,7 @@ impl SchemaRegistry {
         self.relations.iter().map(|r| *r.key()).collect()
     }
 
-    /// Clear the registry
+    /// Clear the registry (memory only, primarily for tests)
     pub fn clear(&self) {
         self.relations.clear();
         self.by_name.clear();
@@ -182,7 +285,10 @@ impl SchemaRegistry {
 
 impl Default for SchemaRegistry {
     fn default() -> Self {
-        Self::new()
+        // In-memory default for tests if needed, or panic?
+        // Ideally should assume temp dir. 
+        // For simplicity in Default trait, we panic or use a temp file
+        panic!("SchemaRegistry requires a path. Use SchemaRegistry::new(path)")
     }
 }
 
@@ -195,6 +301,7 @@ mod tests {
             id: 16384,
             namespace: "public".to_string(),
             name: "users".to_string(),
+            version: 1,
             replica_identity: ReplicaIdentity::Full,
             columns: vec![
                 Column {
@@ -233,11 +340,12 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_registry() {
-        let registry = SchemaRegistry::new();
-        let relation = create_test_relation();
+    fn test_registry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let registry = SchemaRegistry::new(temp_dir.path()).unwrap();
 
-        registry.register(relation.clone());
+        let relation = create_test_relation();
+        registry.register(relation.clone()).unwrap();
 
         assert!(registry.contains(16384));
         assert_eq!(registry.len(), 1);
