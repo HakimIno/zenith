@@ -82,21 +82,10 @@ impl ClickHouseMigrator {
     }
 
     fn generate_create_view_sql(&self, relation: &Relation, view_name: &str) -> String {
-        // Find all versions of this table (logic simplify: assume just v1..cur)
-        // In reality, we should query CH catalog or registry history.
-        // For this step, we'll just query from the current version table for now.
-        // A "Real Unified View" requires UNION ALL logic reading from v1, v2...
-        // But to keep it simple first: View just points to the LATEST version.
-        // Or better: View is a UNION ALL.
-        
-        // TODO: Query existing tables matching pattern `name_v%`
-        // For strict safety, let's just point the view to the LATEST schema for now.
-        // A proper Union View requires smart handling of missing columns in older versions.
-        
         let table_name = format!("{}.{}_v{}", self.config.database, relation.name, relation.version);
         
         format!(
-            "CREATE OR REPLACE VIEW {} AS SELECT * FROM {}",
+            "CREATE OR REPLACE VIEW {} AS SELECT * FROM {} FINAL WHERE _zenith_op != 'DELETE'",
             view_name,
             table_name
         )
@@ -157,7 +146,31 @@ mod tests {
             batch_size: 1000,
             batch_timeout_ms: 100,
             compression: false,
+            async_insert: false,
+            dlq: crate::config::DlqConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_generate_create_view_sql() {
+        let config = test_config();
+        let migrator = ClickHouseMigrator::new(config);
+
+        let relation = Relation {
+            id: 1,
+            namespace: "public".to_string(),
+            name: "users".to_string(),
+            version: 1,
+            replica_identity: crate::schema::ReplicaIdentity::Default,
+            columns: vec![],
+            primary_key_indices: vec![],
+        };
+
+        let sql = migrator.generate_create_view_sql(&relation, "test.users");
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW test.users AS SELECT * FROM test.users_v1 FINAL WHERE _zenith_op != 'DELETE'"
+        );
     }
 
     #[test]

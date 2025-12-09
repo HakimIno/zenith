@@ -51,6 +51,18 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(10_000),
+                reconnect_interval_ms: std::env::var("POSTGRES_RECONNECT_INTERVAL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000),
+                max_concurrent_snapshots: std::env::var("POSTGRES_MAX_CONCURRENT_SNAPSHOTS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4),
+                snapshot_chunk_size: std::env::var("POSTGRES_SNAPSHOT_CHUNK_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(100_000),
             },
             clickhouse: ClickHouseConfig {
                 url: std::env::var("CLICKHOUSE_URL")
@@ -73,6 +85,19 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(true),
+                async_insert: std::env::var("CLICKHOUSE_ASYNC_INSERT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(false),
+                dlq: DlqConfig {
+                    enabled: std::env::var("DLQ_ENABLED")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(false),
+                    path: std::env::var("DLQ_PATH")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| default_dlq_path()),
+                }
             },
             storage: StorageConfig {
                 path: PathBuf::from(
@@ -122,6 +147,15 @@ pub struct PostgresConfig {
     /// Status update interval in milliseconds
     #[serde(default = "default_status_update_interval")]
     pub status_update_interval_ms: u64,
+    /// Reconnect interval in milliseconds
+    #[serde(default = "default_reconnect_interval_ms")]
+    pub reconnect_interval_ms: u64,
+    /// Maximum concurrent snapshot workers
+    #[serde(default = "default_max_concurrent_snapshots")]
+    pub max_concurrent_snapshots: usize,
+    /// Chunk size for resumable snapshots (rows per chunk)
+    #[serde(default = "default_snapshot_chunk_size")]
+    pub snapshot_chunk_size: usize,
 }
 
 impl PostgresConfig {
@@ -152,6 +186,29 @@ pub struct ClickHouseConfig {
     /// Enable LZ4 compression
     #[serde(default = "default_true")]
     pub compression: bool,
+    /// Enable async inserts (server-side batching)
+    #[serde(default = "default_false")]
+    pub async_insert: bool,
+    /// Dead Letter Queue configuration
+    #[serde(default)]
+    pub dlq: DlqConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DlqConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_dlq_path")]
+    pub path: PathBuf,
+}
+
+impl Default for DlqConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_dlq_path(),
+        }
+    }
 }
 
 impl ClickHouseConfig {
@@ -222,8 +279,20 @@ fn default_parallel_slots() -> usize {
     1
 }
 
+fn default_reconnect_interval_ms() -> u64 {
+    1000
+}
+
+fn default_max_concurrent_snapshots() -> usize {
+    4
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_batch_size() -> usize {
@@ -262,8 +331,17 @@ fn default_workers() -> usize {
     num_cpus::get().max(4)
 }
 
+fn default_snapshot_chunk_size() -> usize {
+    100_000
+}
+
 fn default_status_update_interval() -> u64 {
     10_000
+}
+
+
+fn default_dlq_path() -> PathBuf {
+    PathBuf::from("dlq/failed_events.jsonl")
 }
 
 // Add num_cpus as inline

@@ -35,6 +35,7 @@ const SLOT_PREFIX: &[u8] = b"slot:";
 const CHECKPOINT_TREE: &str = "checkpoints";
 const METADATA_TREE: &str = "metadata";
 const SNAPSHOT_TREE: &str = "snapshot_progress";
+const CHUNK_CHECKPOINT_TREE: &str = "chunk_checkpoints";
 
 /// Checkpoint data for a replication slot
 #[derive(Debug, Clone)]
@@ -91,6 +92,7 @@ pub struct WalPositionStore {
     checkpoints: Tree,
     metadata: Tree,
     snapshot_progress: Tree,
+    chunk_checkpoints: Tree,
     cached_lsn: AtomicU64,
     pending_flush: RwLock<PendingFlush>,
 }
@@ -138,6 +140,7 @@ impl WalPositionStore {
         info!("Opened WAL position store, confirmed_lsn: {}", cached_lsn);
 
         Ok(Arc::new(Self {
+            chunk_checkpoints: db.open_tree(CHUNK_CHECKPOINT_TREE)?,
             db,
             checkpoints,
             metadata,
@@ -267,6 +270,24 @@ impl WalPositionStore {
                     Ok(None)
                 }
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Save the last processed Primary Key for a table chunk
+    pub fn set_table_checkpoint(&self, table: &str, last_pk: String) -> Result<()> {
+        self.chunk_checkpoints.insert(table.as_bytes(), last_pk.as_bytes())?;
+        Ok(())
+    }
+
+    /// Get the last processed Primary Key for a table
+    pub fn get_table_checkpoint(&self, table: &str) -> Result<Option<String>> {
+        match self.chunk_checkpoints.get(table.as_bytes())? {
+            Some(data) => {
+                let s = String::from_utf8(data.to_vec())
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                Ok(Some(s))
+            },
             None => Ok(None),
         }
     }

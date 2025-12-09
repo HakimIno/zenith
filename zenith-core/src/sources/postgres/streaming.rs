@@ -20,6 +20,7 @@
 //! - Proper WAL position feedback to prevent WAL bloat
 //! - Native PostgreSQL protocol compliance
 
+use super::connection::{ConnectionParams, PostgresConnection, parse_error_response};
 use super::decoder::{
     current_pg_timestamp, format_lsn, parse_lsn, ReplicationDecoder, ReplicationMessage,
 };
@@ -35,8 +36,7 @@ use bytes::{BufMut, BytesMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, trace, warn};
@@ -117,64 +117,6 @@ impl LsnTracker {
     }
 }
 
-/// Connection parameters parsed from URL
-#[derive(Debug, Clone)]
-struct ConnectionParams {
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    database: String,
-}
-
-impl ConnectionParams {
-    fn from_url(url: &str) -> Result<Self> {
-        // Parse postgres://user:pass@host:port/database
-        let url = url.trim_start_matches("postgres://").trim_start_matches("postgresql://");
-        
-        let (userinfo, rest) = if let Some(at_pos) = url.find('@') {
-            (&url[..at_pos], &url[at_pos + 1..])
-        } else {
-            ("", url)
-        };
-
-        let (user, password) = if let Some(colon_pos) = userinfo.find(':') {
-            (
-                userinfo[..colon_pos].to_string(),
-                Some(userinfo[colon_pos + 1..].to_string()),
-            )
-        } else {
-            (userinfo.to_string(), None)
-        };
-
-        // Remove query parameters
-        let rest = rest.split('?').next().unwrap_or(rest);
-
-        let (hostport, database) = if let Some(slash_pos) = rest.find('/') {
-            (&rest[..slash_pos], rest[slash_pos + 1..].to_string())
-        } else {
-            (rest, "postgres".to_string())
-        };
-
-        let (host, port) = if let Some(colon_pos) = hostport.find(':') {
-            (
-                hostport[..colon_pos].to_string(),
-                hostport[colon_pos + 1..].parse().unwrap_or(5432),
-            )
-        } else {
-            (hostport.to_string(), 5432)
-        };
-
-        Ok(Self {
-            host,
-            port,
-            user: if user.is_empty() { "postgres".to_string() } else { user },
-            password,
-            database,
-        })
-    }
-}
-
 /// PostgreSQL streaming replication source
 ///
 /// Uses raw protocol for real-time WAL streaming.
@@ -248,34 +190,22 @@ impl StreamingReplicationSource {
 
         let params = ConnectionParams::from_url(&self.config.url)?;
 
-        // Connect to PostgreSQL
-        let addr = format!("{}:{}", params.host, params.port);
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
-            Error::connection(format!("Failed to connect to {}: {}", addr, e))
-        })?;
-
-        stream.set_nodelay(true).ok();
-
-        let (reader, writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let mut writer = BufWriter::new(writer);
-
-        // Perform PostgreSQL startup
-        self.perform_startup(&mut reader, &mut writer, &params).await?;
+        // Connect/Handsake via new PostgresConnection
+        let mut conn = PostgresConnection::connect(&params).await?;
 
         info!("Connected to PostgreSQL in replication mode");
         METRICS.set_active_connections("postgres_streaming", 1);
 
         // Create slot if needed
         if self.config.create_slot {
-            self.ensure_slot_exists(&mut reader, &mut writer).await?;
+            self.ensure_slot_exists(&mut conn).await?;
         }
 
         // Get start position
         let actual_start_lsn = if start_lsn > 0 {
             start_lsn
         } else {
-            self.get_slot_lsn(&mut reader, &mut writer).await?
+            self.get_slot_lsn(&mut conn).await?
         };
 
         info!(
@@ -295,299 +225,14 @@ impl StreamingReplicationSource {
             .store(actual_start_lsn, Ordering::Release);
 
         // Start the streaming replication
+        // Split connection for streaming loop
+        let (mut reader, mut writer) = conn.into_split();
         self.run_streaming_replication(&mut reader, &mut writer, actual_start_lsn, tx)
             .await
     }
 
-    /// Perform PostgreSQL startup handshake
-    async fn perform_startup<R, W>(
-        &self,
-        reader: &mut R,
-        writer: &mut W,
-        params: &ConnectionParams,
-    ) -> Result<()>
-    where
-        R: AsyncReadExt + Unpin,
-        W: AsyncWriteExt + Unpin,
-    {
-        let mut buf = BytesMut::new();
-
-        // Build startup message with replication=database
-        let startup_params: Vec<(&str, &str)> = vec![
-            ("user", &params.user),
-            ("database", &params.database),
-            ("replication", "database"),
-            ("client_encoding", "UTF8"),
-        ];
-
-        // Calculate message length
-        let mut msg_len = 4 + 4; // length + protocol version
-        for (key, value) in &startup_params {
-            msg_len += key.len() + 1 + value.len() + 1;
-        }
-        msg_len += 1; // null terminator
-
-        buf.put_i32(msg_len as i32);
-        buf.put_i32(196608); // Protocol version 3.0
-
-        for (key, value) in &startup_params {
-            buf.put_slice(key.as_bytes());
-            buf.put_u8(0);
-            buf.put_slice(value.as_bytes());
-            buf.put_u8(0);
-        }
-        buf.put_u8(0); // terminator
-
-        writer.write_all(&buf).await.map_err(|e| Error::connection(e.to_string()))?;
-        writer.flush().await.map_err(|e| Error::connection(e.to_string()))?;
-
-        // Read response
-        loop {
-            let msg_type = reader.read_u8().await.map_err(|e| Error::connection(e.to_string()))?;
-            let msg_len = reader.read_i32().await.map_err(|e| Error::connection(e.to_string()))? as usize - 4;
-
-            let mut msg_buf = vec![0u8; msg_len];
-            reader.read_exact(&mut msg_buf).await.map_err(|e| Error::connection(e.to_string()))?;
-
-            match msg_type {
-                b'R' => {
-                    // Authentication request
-                    let auth_type = if msg_buf.len() >= 4 {
-                        i32::from_be_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]])
-                    } else {
-                        0
-                    };
-
-                    match auth_type {
-                        0 => {
-                            // AuthenticationOk
-                            debug!("Authentication successful");
-                        }
-                        3 => {
-                            // CleartextPassword
-                            if let Some(ref password) = params.password {
-                                self.send_password(writer, password).await?;
-                            } else {
-                                return Err(Error::auth("Password required but not provided"));
-                            }
-                        }
-                        5 => {
-                            // MD5Password
-                            if msg_buf.len() >= 8 {
-                                let salt = &msg_buf[4..8];
-                                if let Some(ref password) = params.password {
-                                    self.send_md5_password(writer, &params.user, password, salt)
-                                        .await?;
-                                } else {
-                                    return Err(Error::auth("Password required but not provided"));
-                                }
-                            }
-                        }
-                        10 => {
-                            // SASL
-                            return Err(Error::auth(
-                                "SASL authentication not yet supported. Use md5 or trust.",
-                            ));
-                        }
-                        _ => {
-                            return Err(Error::auth(format!(
-                                "Unsupported authentication type: {}",
-                                auth_type
-                            )));
-                        }
-                    }
-                }
-                b'K' => {
-                    // BackendKeyData - we can ignore this
-                    debug!("Received BackendKeyData");
-                }
-                b'S' => {
-                    // ParameterStatus - we can ignore this
-                    trace!("Received ParameterStatus");
-                }
-                b'Z' => {
-                    // ReadyForQuery
-                    debug!("Server ready for queries");
-                    return Ok(());
-                }
-                b'E' => {
-                    // ErrorResponse
-                    let error_msg = self.parse_error_response(&msg_buf);
-                    return Err(Error::connection(format!("Server error: {}", error_msg)));
-                }
-                _ => {
-                    trace!("Unknown message type during startup: {}", msg_type as char);
-                }
-            }
-        }
-    }
-
-    /// Send cleartext password
-    async fn send_password<W: AsyncWriteExt + Unpin>(
-        &self,
-        writer: &mut W,
-        password: &str,
-    ) -> Result<()> {
-        let mut buf = BytesMut::new();
-        buf.put_u8(b'p');
-        buf.put_i32((4 + password.len() + 1) as i32);
-        buf.put_slice(password.as_bytes());
-        buf.put_u8(0);
-
-        writer.write_all(&buf).await.map_err(|e| Error::connection(e.to_string()))?;
-        writer.flush().await.map_err(|e| Error::connection(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Send MD5 password
-    async fn send_md5_password<W: AsyncWriteExt + Unpin>(
-        &self,
-        writer: &mut W,
-        user: &str,
-        password: &str,
-        salt: &[u8],
-    ) -> Result<()> {
-        // MD5(MD5(password + user) + salt)
-        let inner = format!("{}{}", password, user);
-        let inner_hash = md5::compute(inner.as_bytes());
-        let inner_hex = format!("{:x}", inner_hash);
-
-        let mut outer = inner_hex.as_bytes().to_vec();
-        outer.extend_from_slice(salt);
-        let outer_hash = md5::compute(&outer);
-        let password_hash = format!("md5{:x}", outer_hash);
-
-        let mut buf = BytesMut::new();
-        buf.put_u8(b'p');
-        buf.put_i32((4 + password_hash.len() + 1) as i32);
-        buf.put_slice(password_hash.as_bytes());
-        buf.put_u8(0);
-
-        writer.write_all(&buf).await.map_err(|e| Error::connection(e.to_string()))?;
-        writer.flush().await.map_err(|e| Error::connection(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Parse error response message
-    fn parse_error_response(&self, data: &[u8]) -> String {
-        let mut message = String::new();
-        let mut i = 0;
-        while i < data.len() {
-            let field_type = data[i];
-            i += 1;
-            if field_type == 0 {
-                break;
-            }
-            let end = data[i..].iter().position(|&b| b == 0).unwrap_or(data.len() - i);
-            let value = String::from_utf8_lossy(&data[i..i + end]);
-            i += end + 1;
-
-            match field_type {
-                b'M' => message = value.to_string(),
-                _ => {}
-            }
-        }
-        message
-    }
-
-    /// Execute a simple query
-    async fn simple_query<R, W>(
-        &self,
-        reader: &mut R,
-        writer: &mut W,
-        query: &str,
-    ) -> Result<Vec<Vec<Option<String>>>>
-    where
-        R: AsyncReadExt + Unpin,
-        W: AsyncWriteExt + Unpin,
-    {
-        let mut buf = BytesMut::new();
-        buf.put_u8(b'Q');
-        buf.put_i32((4 + query.len() + 1) as i32);
-        buf.put_slice(query.as_bytes());
-        buf.put_u8(0);
-
-        writer.write_all(&buf).await.map_err(|e| Error::connection(e.to_string()))?;
-        writer.flush().await.map_err(|e| Error::connection(e.to_string()))?;
-
-        let mut rows = Vec::new();
-
-        loop {
-            let msg_type = reader.read_u8().await.map_err(|e| Error::connection(e.to_string()))?;
-            let msg_len = reader.read_i32().await.map_err(|e| Error::connection(e.to_string()))? as usize - 4;
-
-            let mut msg_buf = vec![0u8; msg_len];
-            reader.read_exact(&mut msg_buf).await.map_err(|e| Error::connection(e.to_string()))?;
-
-            match msg_type {
-                b'T' => {
-                    // RowDescription - we ignore column metadata for now
-                }
-                b'D' => {
-                    // DataRow
-                    let row = self.parse_data_row(&msg_buf)?;
-                    rows.push(row);
-                }
-                b'C' => {
-                    // CommandComplete
-                }
-                b'Z' => {
-                    // ReadyForQuery
-                    break;
-                }
-                b'E' => {
-                    let error_msg = self.parse_error_response(&msg_buf);
-                    return Err(Error::parse(format!("Query error: {}", error_msg)));
-                }
-                b'N' => {
-                    // NoticeResponse - ignore
-                }
-                _ => {}
-            }
-        }
-
-        Ok(rows)
-    }
-
-    /// Parse a DataRow message
-    fn parse_data_row(&self, data: &[u8]) -> Result<Vec<Option<String>>> {
-        if data.len() < 2 {
-            return Ok(Vec::new());
-        }
-
-        let num_cols = i16::from_be_bytes([data[0], data[1]]) as usize;
-        let mut cols = Vec::with_capacity(num_cols);
-        let mut pos = 2;
-
-        for _ in 0..num_cols {
-            if pos + 4 > data.len() {
-                break;
-            }
-            let col_len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            pos += 4;
-
-            if col_len == -1 {
-                cols.push(None);
-            } else {
-                let col_len = col_len as usize;
-                if pos + col_len > data.len() {
-                    break;
-                }
-                let value = String::from_utf8_lossy(&data[pos..pos + col_len]).to_string();
-                cols.push(Some(value));
-                pos += col_len;
-            }
-        }
-
-        Ok(cols)
-    }
-
     /// Ensure the replication slot exists
-    async fn ensure_slot_exists<R, W>(&self, reader: &mut R, writer: &mut W) -> Result<()>
-    where
-        R: AsyncReadExt + Unpin,
-        W: AsyncWriteExt + Unpin,
-    {
+    async fn ensure_slot_exists(&self, conn: &mut PostgresConnection) -> Result<()> {
         let slot_name = &self.config.slot_name;
 
         // Check if slot exists
@@ -596,7 +241,7 @@ impl StreamingReplicationSource {
             slot_name
         );
 
-        let rows = self.simple_query(reader, writer, &check_query).await?;
+        let rows = conn.simple_query(&check_query).await?;
         let exists = !rows.is_empty();
 
         if !exists {
@@ -607,7 +252,7 @@ impl StreamingReplicationSource {
                 slot_name
             );
 
-            self.simple_query(reader, writer, &create_query).await?;
+            conn.simple_query(&create_query).await?;
             info!("Created replication slot '{}'", slot_name);
         } else {
             debug!("Replication slot '{}' already exists", slot_name);
@@ -617,17 +262,13 @@ impl StreamingReplicationSource {
     }
 
     /// Get the confirmed flush LSN from the slot
-    async fn get_slot_lsn<R, W>(&self, reader: &mut R, writer: &mut W) -> Result<u64>
-    where
-        R: AsyncReadExt + Unpin,
-        W: AsyncWriteExt + Unpin,
-    {
+    async fn get_slot_lsn(&self, conn: &mut PostgresConnection) -> Result<u64> {
         let query = format!(
             "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '{}'",
             self.config.slot_name
         );
 
-        let rows = self.simple_query(reader, writer, &query).await?;
+        let rows = conn.simple_query(&query).await?;
 
         for row in rows {
             if let Some(Some(lsn_str)) = row.first() {
@@ -665,7 +306,9 @@ impl StreamingReplicationSource {
 
         info!("Starting replication: {}", start_cmd);
 
-        // Send query
+        // We can't use PostgresConnection here easily because we split it.
+        // But we can replicate send_command logic or keep using raw writer since we are in streaming mode anyway.
+        // Let's use raw writer here as it's cleaner for the hot loop context.
         let mut buf = BytesMut::new();
         buf.put_u8(b'Q');
         buf.put_i32((4 + start_cmd.len() + 1) as i32);
@@ -690,7 +333,7 @@ impl StreamingReplicationSource {
                 info!("Streaming replication started");
             }
             b'E' => {
-                let error_msg = self.parse_error_response(&msg_buf);
+                let error_msg = parse_error_response(&msg_buf);
                 return Err(Error::connection(format!(
                     "Failed to start replication: {}",
                     error_msg
@@ -865,7 +508,7 @@ impl StreamingReplicationSource {
             b'E' => {
                 let mut data = vec![0u8; msg_len];
                 reader.read_exact(&mut data).await.map_err(|e| Error::connection(e.to_string()))?;
-                let error_msg = self.parse_error_response(&data);
+                let error_msg = parse_error_response(&data);
                 Err(Error::connection(format!("Server error: {}", error_msg)))
             }
             _ => {

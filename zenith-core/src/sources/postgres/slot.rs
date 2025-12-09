@@ -360,6 +360,9 @@ mod tests {
             parallel_slots: 4,
             create_slot: true,
             status_update_interval_ms: 10000,
+            reconnect_interval_ms: 1000,
+            max_concurrent_snapshots: 4,
+            snapshot_chunk_size: 100_000,
         };
 
         // Single slot

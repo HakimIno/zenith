@@ -15,6 +15,7 @@
 //! ```
 
 pub mod config;
+pub mod dlq;
 pub mod error;
 pub mod metrics;
 pub mod pipeline;

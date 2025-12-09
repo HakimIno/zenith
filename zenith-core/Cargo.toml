@@ -57,6 +57,7 @@ once_cell.workspace = true
 pin-project-lite.workspace = true
 flate2.workspace = true
 md5.workspace = true
+async-channel = "2.5.0"
 
 [dev-dependencies]
 tempfile = "3.14"

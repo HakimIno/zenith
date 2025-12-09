@@ -22,6 +22,8 @@
 //! Arc::new(source).start(0, tx).await?;
 //! ```
 
+pub mod binary_copy;
+pub mod connection;
 pub mod decoder;
 pub mod pgoutput_parser;
 pub mod slot;
